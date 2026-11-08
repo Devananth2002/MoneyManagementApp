@@ -91,6 +91,7 @@ class Security(ctx: Context) {
         enabled = true; method = "phone"
     }
 
+    @JvmName("updateBio")
     fun setBio(on: Boolean) { p.edit().putBoolean("bio", on).apply(); bio = on }
 
     fun disable() { p.edit().clear().apply(); enabled = false; bio = false }
