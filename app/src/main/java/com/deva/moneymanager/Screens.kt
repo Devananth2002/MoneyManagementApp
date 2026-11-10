@@ -82,11 +82,13 @@ fun MonthPicker(m: YearMonth, onDismiss: () -> Unit, onPick: (YearMonth) -> Unit
         }
     }
 }
+
 @Composable
 fun TxnRow(t: Txn, names: Map<Long, String>, onEdit: (Txn) -> Unit, onDelete: (Long) -> Unit) {
     val isT = t.type == "t"
     val isS = t.type.startsWith("s")
-    val who = t.personId?.let { peopleMap[it] } ?: ""
+    val splitPeople = if (t.splitBy.isNotBlank()) parseSplitMap(t.splitBy).keys.mapNotNull { peopleMap[it] } else emptyList()
+    val who = if (splitPeople.isNotEmpty()) splitPeople.joinToString(", ") else t.personId?.let { peopleMap[it] } ?: ""
     val sign = when (t.type) { "e", "so" -> "−"; "i", "si" -> "+"; else -> "" }
     val color = when (t.type) {
         "e", "so" -> MaterialTheme.colorScheme.error
@@ -96,7 +98,12 @@ fun TxnRow(t: Txn, names: Map<Long, String>, onEdit: (Txn) -> Unit, onDelete: (L
     val to = t.toAccountId?.let { names[it] } ?: ""
     val acct = names[t.accountId] ?: ""
     val where = if (isT) "$acct → $to" else acct
-    val extra = if (t.type == "e" && t.share > 0 && who.isNotBlank()) "with $who · their share ${inr0(t.share)}" else ""
+    val extra = when {
+        t.type == "e" && t.splitBy.isNotBlank() && splitPeople.isNotEmpty() ->
+            "with ${splitPeople.joinToString(", ")} · shared ${inr0(txnSplitTotal(t))}"
+        t.type == "e" && t.share > 0 && who.isNotBlank() -> "with $who · their share ${inr0(t.share)}"
+        else -> ""
+    }
     val title = when {
         t.type == "si" -> "$who paid you"
         isS -> "You paid $who"
@@ -143,7 +150,7 @@ fun Home(
     val now = YearMonth.now()
     val mt = inMonth(txns, now)
     val inc = mt.filter { it.type == "i" }.sumOf { it.amount }
-    val exp = mt.filter { it.type == "e" }.sumOf { it.amount - it.share }
+    val exp = mt.filter { it.type == "e" }.sumOf { it.amount - if (it.splitBy.isNotBlank()) txnSplitTotal(it) else it.share }
     val spent = catTotals(mt)
     val names = accounts.associate { it.id to it.name }
     val bank = accounts.sumOf { balance(it, txns) }
@@ -387,7 +394,7 @@ fun History(
             contentPadding = PaddingValues(bottom = 96.dp)) {
             list.groupBy { it.date }.forEach { (d, rows) ->
                 item(key = "h$d") {
-                    val day = rows.filter { it.type == "e" }.sumOf { it.amount - it.share }
+                    val day = rows.filter { it.type == "e" }.sumOf { it.amount - if (it.splitBy.isNotBlank()) txnSplitTotal(it) else it.share }
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(dayLabel(d), style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -411,7 +418,7 @@ fun Trend(month: YearMonth, txns: List<Txn>) {
     val ms = (5 downTo 0).map { month.minusMonths(it.toLong()) }
     val data = ms.map { m ->
         val t = inMonth(txns, m)
-        t.filter { it.type == "i" }.sumOf { x -> x.amount } to t.filter { it.type == "e" }.sumOf { x -> x.amount - x.share }
+        t.filter { it.type == "i" }.sumOf { x -> x.amount } to t.filter { it.type == "e" }.sumOf { x -> x.amount - if (x.splitBy.isNotBlank()) txnSplitTotal(x) else x.share }
     }
     val mx = maxOf(1.0, data.maxOf { maxOf(it.first, it.second) })
     val inC = Good
@@ -442,7 +449,7 @@ fun Report(
 ) {
     val mt = inMonth(txns, month)
     val inc = mt.filter { it.type == "i" }.sumOf { it.amount }
-    val exp = mt.filter { it.type == "e" }.sumOf { it.amount - it.share }
+    val exp = mt.filter { it.type == "e" }.sumOf { it.amount - if (it.splitBy.isNotBlank()) txnSplitTotal(it) else it.share }
     val net = inc - exp
     val spent = catTotals(mt)
     val days = if (month == YearMonth.now()) LocalDate.now().dayOfMonth else month.lengthOfMonth()
@@ -588,27 +595,39 @@ fun AddForm(accounts: List<Account>, persons: List<Person>, initial: Txn?, start
     }
     var rep by remember { mutableStateOf(false) }
     var picker by remember { mutableStateOf(false) }
-    var split by remember { mutableStateOf(initial?.personId != null) }
-    var friendIdx by remember {
-        mutableStateOf(initial?.personId?.let { id ->
-            val i = persons.indexOfFirst { it.id == id }
-            if (i < 0) persons.size else i
-        } ?: 0)
+    var split by remember { mutableStateOf(initial?.personId != null || !initial?.splitBy.isNullOrBlank()) }
+    val defaultSplitIds = remember(initial?.id, initial?.personId, initial?.splitBy) {
+        if (!initial?.splitBy.isNullOrBlank()) parseSplitMap(initial!!.splitBy).keys.toSet()
+        else initial?.personId?.let { setOf(it) } ?: emptySet()
     }
-    var newName by remember { mutableStateOf("") }
-    var shareTxt by remember { mutableStateOf(initial?.takeIf { it.share > 0 }?.let { plain(it.share) } ?: "") }
+    var selectedSplitIds by remember(initial?.id, initial?.personId, initial?.splitBy) { mutableStateOf(defaultSplitIds) }
+    var equalSplit by remember { mutableStateOf(true) }
+    val customSplit = remember { mutableStateMapOf<Long, String>() }
     val today = LocalDate.now()
     val amount = amt.toDoubleOrNull()
-    val share = shareTxt.toDoubleOrNull()
-    val newFriend = friendIdx >= persons.size
+    val selectedSplitList = selectedSplitIds.toList()
+    val splitMap: Map<Long, Double> = if (!split || type != "e" || selectedSplitList.isEmpty()) emptyMap() else selectedSplitList.associateWith { id ->
+        if (equalSplit) (amount ?: 0.0) / selectedSplitList.size else (customSplit[id]?.toDoubleOrNull() ?: 0.0)
+    }.filterValues { it > 0.0 }
+    val totalSplit = splitMap.values.sum()
     val splitOn = split && type == "e"
-    val splitOk = !splitOn || (share != null && share > 0 && amount != null && share <= amount && (!newFriend || newName.isNotBlank()))
+    val splitOk = !splitOn || (selectedSplitList.isNotEmpty() && amount != null && amount > 0 && totalSplit > 0.0 && totalSplit <= amount && splitMap.values.all { it > 0.0 })
     val ok = amount != null && amount > 0 && (type != "t" || from != to) && splitOk
     val tint = when (type) { "e" -> MaterialTheme.colorScheme.error; "i" -> Good; else -> MaterialTheme.colorScheme.primary }
     val names = accounts.map { it.name }
     val acctIcons = accounts.map { acctEmoji(it.name) }
-    val friendNames = persons.map { it.name } + "New friend"
-    val friendIcons = persons.map { "🙂" } + "➕"
+
+    LaunchedEffect(amount, equalSplit, selectedSplitList.size) {
+        if (splitOn && !equalSplit && amount != null && selectedSplitList.isNotEmpty()) {
+            val perFriend = amount / selectedSplitList.size
+            selectedSplitList.forEach { id ->
+                if (customSplit[id].isNullOrBlank()) customSplit[id] = plain(perFriend)
+            }
+        }
+        if (splitOn && equalSplit) {
+            selectedSplitList.forEach { id -> customSplit.remove(id) }
+        }
+    }
 
     Column(
         Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding().imePadding()
@@ -639,17 +658,39 @@ fun AddForm(accounts: List<Account>, persons: List<Person>, initial: Txn?, start
                 Text("Split with a friend")
             }
             if (split) {
-                Pick("Friend", friendNames, friendIdx, friendIcons) { friendIdx = it }
-                if (newFriend) OutlinedTextField(newName, { newName = it }, Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp), label = { Text("Friend's name") }, singleLine = true)
-                OutlinedTextField(
-                    shareTxt, { shareTxt = it }, Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp),
-                    label = { Text("Friend's share (${sym()})") }, singleLine = true, keyboardOptions = Decimal,
-                    supportingText = { Text("They owe you this. Only the rest counts as your spending.") }
-                )
-                Row {
-                    FilterChip(selected = false, onClick = { if (amount != null) shareTxt = plain(amount / 2) },
-                        label = { Text("Half") })
+                if (persons.isEmpty()) {
+                    Muted("Add a few friends first in Friends, then choose them here.")
+                } else {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        persons.forEach { p ->
+                            FilterChip(
+                                selected = selectedSplitIds.contains(p.id),
+                                onClick = {
+                                    selectedSplitIds = if (selectedSplitIds.contains(p.id)) selectedSplitIds - p.id else selectedSplitIds + p.id
+                                },
+                                label = { Text(p.name) }
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = equalSplit, onClick = { equalSplit = true }, label = { Text("Equal split") })
+                        FilterChip(selected = !equalSplit, onClick = { equalSplit = false }, label = { Text("Custom amounts") })
+                    }
+                    if (!equalSplit && selectedSplitList.isNotEmpty()) {
+                        selectedSplitList.forEach { id ->
+                            val friend = persons.firstOrNull { it.id == id } ?: return@forEach
+                            OutlinedTextField(
+                                customSplit[id] ?: "",
+                                { customSplit[id] = it },
+                                Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(14.dp),
+                                label = { Text("${friend.name} share (${sym()})") },
+                                singleLine = true,
+                                keyboardOptions = Decimal
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -670,6 +711,11 @@ fun AddForm(accounts: List<Account>, persons: List<Person>, initial: Txn?, start
         Button(
             enabled = ok, modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp),
             onClick = {
+                val splitData = if (!splitOn || selectedSplitList.isEmpty()) emptyMap() else selectedSplitList.associateWith { id ->
+                    if (equalSplit) (amount ?: 0.0) / selectedSplitList.size else (customSplit[id]?.toDoubleOrNull() ?: 0.0)
+                }.filterValues { it > 0.0 }
+                val primaryFriend = if (splitData.size == 1) splitData.keys.first() else null
+                val primaryShare = if (primaryFriend != null) splitData[primaryFriend] ?: 0.0 else 0.0
                 onSave(
                     Txn(
                         id = initial?.id ?: 0,
@@ -677,11 +723,12 @@ fun AddForm(accounts: List<Account>, persons: List<Person>, initial: Txn?, start
                         toAccountId = if (type == "t") accounts[to].id else null,
                         category = if (type == "t") "" else cats[cat],
                         note = note.trim(), date = date.toString(),
-                        personId = if (splitOn && !newFriend) persons[friendIdx].id else null,
-                        share = if (splitOn) share!! else 0.0
+                        personId = if (splitOn && primaryFriend != null) primaryFriend else null,
+                        share = if (splitOn && primaryFriend != null) primaryShare else 0.0,
+                        splitBy = if (splitOn && splitData.isNotEmpty()) org.json.JSONObject(splitData).toString() else ""
                     ),
                     rep && type != "t" && !editing && !splitOn,
-                    if (splitOn && newFriend) newName.trim() else null
+                    null
                 )
             }
         ) { Text(if (editing) "Save changes" else "Save") }
@@ -717,3 +764,4 @@ fun EditAccountDialog(a: Account, current: Double, onDismiss: () -> Unit, onSave
         Muted("Set this to what your bank app shows. Your entries stay as they are.")
     }
 }
+
