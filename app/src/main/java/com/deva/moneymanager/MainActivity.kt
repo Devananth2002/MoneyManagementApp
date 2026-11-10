@@ -79,7 +79,7 @@ fun App(vm: MainVm, activity: FragmentActivity, sec: Security) {
     val txns by vm.txns.collectAsStateWithLifecycle()
     val budgets by vm.budgets.collectAsStateWithLifecycle()
     val recs by vm.recs.collectAsStateWithLifecycle()
-    val holdings by vm.holdings.collectAsStateWithLifecycle()
+    val holdings: List<Holding> by vm.holdings.collectAsStateWithLifecycle()
     val persons by vm.persons.collectAsStateWithLifecycle()
     val cats by vm.cats.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(0) }
