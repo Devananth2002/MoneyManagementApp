@@ -26,7 +26,8 @@ fun toJson(d: BackupData): String {
             put(JSONObject().put("id", it.id).put("type", it.type).put("amount", it.amount)
                 .put("accountId", it.accountId).put("toAccountId", it.toAccountId ?: JSONObject.NULL)
                 .put("category", it.category).put("note", it.note).put("date", it.date)
-                .put("personId", it.personId ?: JSONObject.NULL).put("share", it.share))
+                .put("personId", it.personId ?: JSONObject.NULL).put("share", it.share)
+                .put("splitBy", it.splitBy))
         }
     })
     o.put("budgets", JSONArray().apply {
@@ -70,7 +71,8 @@ fun fromJson(s: String): BackupData {
                 if (it.isNull("toAccountId")) null else it.getLong("toAccountId"),
                 it.getString("category"), it.getString("note"), it.getString("date"),
                 if (!it.has("personId") || it.isNull("personId")) null else it.getLong("personId"),
-                it.optDouble("share", 0.0))
+                it.optDouble("share", 0.0),
+                it.optString("splitBy", ""))
         },
         list("budgets") { Budget(it.getString("category"), it.getDouble("monthlyLimit")) },
         list("recs") {
@@ -86,3 +88,4 @@ fun fromJson(s: String): BackupData {
         list("cats") { Cat(it.getLong("id"), it.getString("name"), it.getBoolean("income"), it.getString("emoji")) }
     )
 }
+

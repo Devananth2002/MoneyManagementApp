@@ -9,6 +9,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.text.NumberFormat
 import java.time.LocalDate
 import java.time.YearMonth
@@ -38,7 +39,8 @@ data class Txn(
     val note: String = "",
     val date: String, // yyyy-MM-dd
     val personId: Long? = null, // the friend this entry is shared with or settled with
-    @ColumnInfo(defaultValue = "0") val share: Double = 0.0 // the friend's part of an expense
+    @ColumnInfo(defaultValue = "0") val share: Double = 0.0, // the friend's part of an expense
+    @ColumnInfo(defaultValue = "") val splitBy: String = "" // JSON map of friendId -> share, used for multiple friends
 )
 
 // A friend you share money with
@@ -141,6 +143,12 @@ interface MoneyDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putCats(l: List<Cat>)
 }
 
+val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE `Txn` ADD COLUMN `splitBy` TEXT NOT NULL DEFAULT ''")
+    }
+}
+
 // Keeps your existing data when investments can be priced automatically
 val MIGRATION_4_5 = object : Migration(4, 5) {
     override fun migrate(db: SupportSQLiteDatabase) {
@@ -170,7 +178,7 @@ val MIGRATION_2_3 = object : Migration(2, 3) {
 
 @Database(
     entities = [Account::class, Txn::class, Budget::class, Recurring::class, Holding::class, Person::class, Cat::class],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class AppDb : RoomDatabase() {
@@ -180,7 +188,7 @@ abstract class AppDb : RoomDatabase() {
         @Volatile private var inst: AppDb? = null
         fun get(c: Context): AppDb = inst ?: synchronized(this) {
             inst ?: Room.databaseBuilder(c.applicationContext, AppDb::class.java, "money.db")
-                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .fallbackToDestructiveMigration()
                 .build().also { inst = it }
         }
@@ -193,7 +201,7 @@ class MainVm(app: Application) : AndroidViewModel(app) {
     val accounts = dao.accounts().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val txns = dao.txns().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val budgets = dao.budgets().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
-    val recs = dao.recurrings().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    val recs = dao.recurringNow().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val holdings = dao.holdings().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val persons = dao.persons().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val cats = dao.cats().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -237,7 +245,7 @@ class MainVm(app: Application) : AndroidViewModel(app) {
 
     fun addTx(t0: Txn, repeat: Boolean, newFriend: String? = null) {
         viewModelScope.launch {
-            val t = if (newFriend != null) t0.copy(personId = personIdFor(newFriend)) else t0
+            val t = if (newFriend != null) t0.copy(personId = personIdFor(newFriend), splitBy = "") else t0
             dao.addTxn(t)
             if (repeat) {
                 val d = LocalDate.parse(t.date)
@@ -256,7 +264,7 @@ class MainVm(app: Application) : AndroidViewModel(app) {
     fun setValue(id: Long, v: Double) { viewModelScope.launch { dao.setValue(id, v) } }
     fun deleteHolding(id: Long) { viewModelScope.launch { dao.deleteHolding(id) } }
     fun updateTx(t: Txn, newFriend: String? = null) {
-        viewModelScope.launch { dao.updateTxn(if (newFriend != null) t.copy(personId = personIdFor(newFriend)) else t) }
+        viewModelScope.launch { dao.updateTxn(if (newFriend != null) t.copy(personId = personIdFor(newFriend), splitBy = "") else t) }
     }
     fun restoreTx(t: Txn) { viewModelScope.launch { dao.putTxns(listOf(t)) } }
     fun addPerson(name: String) { viewModelScope.launch { personIdFor(name) } }
@@ -306,6 +314,17 @@ class MainVm(app: Application) : AndroidViewModel(app) {
     }
 }
 
+private fun parseSplitMap(raw: String): Map<Long, Double> {
+    if (raw.isBlank()) return emptyMap()
+    return runCatching {
+        val obj = JSONObject(raw)
+        obj.keys().asSequence().associate { key -> key.toLong() to obj.getDouble(key) }
+    }.getOrDefault(emptyMap())
+}
+
+fun txnSplitShare(txn: Txn, personId: Long): Double = parseSplitMap(txn.splitBy)[personId] ?: 0.0
+fun txnSplitTotal(txn: Txn): Double = parseSplitMap(txn.splitBy).values.sum()
+
 // Opening balance + everything that came in - everything that went out
 fun balance(a: Account, t: List<Txn>): Double = a.opening + t.sumOf {
     when {
@@ -320,21 +339,30 @@ fun balance(a: Account, t: List<Txn>): Double = a.opening + t.sumOf {
 }
 
 // What a friend owes you (positive) or what you owe them (negative)
-fun owed(personId: Long, t: List<Txn>): Double = t.filter { it.personId == personId }.sumOf {
-    when (it.type) { "e" -> it.share; "so" -> it.amount; "si" -> -it.amount; else -> 0.0 }
+fun owed(personId: Long, t: List<Txn>): Double = t.sumOf {
+    when {
+        it.type == "e" && it.personId == personId -> it.share
+        it.type == "e" && it.splitBy.isNotBlank() -> txnSplitShare(it, personId)
+        it.type == "so" -> it.amount
+        it.type == "si" -> -it.amount
+        else -> 0.0
+    }
 }
 
 fun inMonth(t: List<Txn>, m: YearMonth): List<Txn> = t.filter { it.date.startsWith(m.toString()) }
 
 fun catTotals(t: List<Txn>): Map<String, Double> =
-    t.filter { it.type == "e" }.groupBy { it.category }.mapValues { e -> e.value.sumOf { x -> x.amount - x.share } }
-
+    t.filter { it.type == "e" }.groupBy { it.category }.mapValues { e ->
+        e.value.sumOf { x -> x.amount - if (x.splitBy.isNotBlank()) txnSplitTotal(x) else x.share }
+    }
 
 fun csvOf(t: List<Txn>, a: List<Account>, p: List<Person>): String {
     val n = a.associate { it.id to it.name }
     val pn = p.associate { it.id to it.name }
     fun q(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
     val rows = t.map { x ->
+        val splitNames = if (x.splitBy.isNotBlank()) parseSplitMap(x.splitBy).keys.mapNotNull { pn[it] }.joinToString("; ") else x.personId?.let { pn[it] } ?: ""
+        val splitAmount = if (x.splitBy.isNotBlank()) txnSplitTotal(x) else x.share
         listOf(
             x.date,
             when (x.type) { "e" -> "Expense"; "i" -> "Income"; "si" -> "Friend paid you"; "so" -> "You paid friend"; else -> "Transfer" },
@@ -343,9 +371,11 @@ fun csvOf(t: List<Txn>, a: List<Account>, p: List<Person>): String {
             q(x.category),
             x.amount.toString(),
             q(x.note),
-            q(x.personId?.let { pn[it] } ?: ""),
-            x.share.toString()
+            q(splitNames),
+            splitAmount.toString()
         ).joinToString(",")
     }
     return (listOf("Date,Type,Account,To account,Category,Amount,Note,Friend,Friend share") + rows).joinToString("\n")
 }
+
+val money = 1
